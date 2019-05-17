@@ -292,8 +292,8 @@ static void media_player_read_packet(struct media_player *mp) {
 			{
 				ilog(LOG_DEBUG, "Rewinding file...");
 				av_seek_frame(mp->fmtctx,-1,0,AVSEEK_FLAG_BACKWARD);
-				// schedule 250ms out
-				timeval_add_usec(&mp->next_run, 250000);
+				
+				timeval_add_usec(&mp->next_run, 1000);
 				timerthread_obj_schedule_abs(&mp->tt_obj, &mp->next_run);
 				
 			}
