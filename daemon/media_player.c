@@ -283,22 +283,25 @@ static void media_player_read_packet(struct media_player *mp) {
 		return;
 
 	int ret = av_read_frame(mp->fmtctx, &mp->pkt);
-	if (ret < 0) {
-		if (ret == AVERROR_EOF) {
-			ilog(LOG_DEBUG, "EOF reading from media stream");
-			ilog(LOG_DEBUG, "Troy was here 2019 bitchezzz");
-			//rewind and try again
+
+	if (ret == AVERROR_EOF)
+	{
+			ilog(LOG_DEBUG, "Troy was here 2019");
 			if (1/*looping enabled*/)
 			{
-				ilog(LOG_DEBUG, "Rewinding file...");
+				//rewind and try again
+				ilog(LOG_DEBUG, "File end reached, rewinding file...");
 				av_seek_frame(mp->fmtctx,-1,0,AVSEEK_FLAG_BACKWARD);
-				
-				timeval_add_usec(&mp->next_run, 1000);
-				timerthread_obj_schedule_abs(&mp->tt_obj, &mp->next_run);
-				
+				ret = av_read_frame(mp->fmtctx, &mp->pkt);
 			}
-			return;
-		}
+			else
+			{
+				ilog(LOG_DEBUG, "EOF reading from media stream");
+				return;
+			}
+
+	}
+	if (ret < 0) {
 		ilog(LOG_ERR, "Error while reading from media stream");
 		return;
 	}
