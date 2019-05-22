@@ -45,6 +45,7 @@ struct media_player {
 	AVIOContext *avioctx;
 	str *blob;
 	str read_pos;
+	int loop;
 };
 
 INLINE void media_player_put(struct media_player **mp) {

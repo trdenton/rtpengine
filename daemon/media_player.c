@@ -133,6 +133,8 @@ struct media_player *media_player_new(struct call_monologue *ml) {
 	mp->pkt.data = NULL;
 	mp->pkt.size = 0;
 
+	mp->loop = 0;
+
 	return mp;
 #else
 	return NULL;
@@ -287,7 +289,7 @@ static void media_player_read_packet(struct media_player *mp) {
 	if (ret == AVERROR_EOF)
 	{
 			ilog(LOG_DEBUG, "Troy was here 2019");
-			if (1/*looping enabled*/)
+			if (mp->loop)
 			{
 				//rewind and try again
 				ilog(LOG_DEBUG, "File end reached, rewinding file...");

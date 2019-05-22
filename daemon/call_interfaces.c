@@ -1774,6 +1774,11 @@ const char *call_play_media_ng(bencode_item_t *input, bencode_item_t *output) {
 		monologue->player = media_player_new(monologue);
 
 	err = "No media file specified";
+	if (bencode_dictionary_get_str(input,"loop",&str))
+	{
+		if (!str_cmp(&str,"1"))
+			monologue->player->loop=1;
+	}
 	if (bencode_dictionary_get_str(input, "file", &str)) {
 		err = "Failed to start media playback from file";
 		if (media_player_play_file(monologue->player, &str))
