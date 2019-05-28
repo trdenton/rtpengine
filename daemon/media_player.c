@@ -288,7 +288,6 @@ static void media_player_read_packet(struct media_player *mp) {
 
 	if (ret == AVERROR_EOF)
 	{
-			ilog(LOG_DEBUG, "Troy was here 2019");
 			if (mp->loop)
 			{
 				//rewind and try again
