@@ -235,6 +235,13 @@ The B<parsable> output style is similar, but makes the ID easier to
 parse by enclosing it in quotes, such as B<[ID="CALLID"]>
 or B<[ID="CALLID" port="12345"]>.
 
+=item B<--dtmf-log-dest=>I<IP46>:I<PORT>
+
+Configures a target address for logging detected DTMF event. Similar
+to the feature enabled by B<--log-facilty-dtmf>, but instead of writing
+detected DTMF events to syslog, this sends the JSON payload to the
+given address as UDP packets.
+
 =item B<--log-srtp-keys>
 
 Write SRTP keys to error log instead of debug log.
@@ -647,6 +654,22 @@ be used in place of the placeholder when querying the database.
 An example configuration might look like this:
 
   mysql-query = select data from voip.files where id = %llu
+
+=item B<--endpoint-learning=>B<delayed>|B<immediate>|B<off>|B<heuristic>
+
+Chooses one of the available algorithms to learn RTP endpoint addresses. The
+legacy setting is B<delayed> which waits 3 seconds before committing to an
+endpoint address, which is then learned from the first incoming RTP packet seen
+after this delay. The setting B<immediate> learns the endpoint address from the
+first incoming packet seen without the 3-second delay. Using B<off> disables
+endpoint learning altogether, likely breaking clients behind NAT. The setting
+B<heuristic> includes the 3-second delay, but source addresses seen from
+incoming RTP packets are ranked according to preference: If a packet with a
+source address and port matching the SDP address is seen, this address is used.
+Otherwise, if a packet with a matching source address (but a different port) is
+seen, that address is used. Otherwise, if a packet with a matching source port
+(but different address) is seen, that address is used. Otherwise, the source
+address of any incoming packet seen is used.
 
 =back
 

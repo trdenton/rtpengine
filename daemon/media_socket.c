@@ -93,6 +93,7 @@ const struct transport_protocol transport_protocols[] = {
 	[PROTO_RTP_AVP] = {
 		.index		= PROTO_RTP_AVP,
 		.name		= "RTP/AVP",
+		.avpf_proto	= PROTO_RTP_AVPF,
 		.rtp		= 1,
 		.srtp		= 0,
 		.avpf		= 0,
@@ -101,6 +102,7 @@ const struct transport_protocol transport_protocols[] = {
 	[PROTO_RTP_SAVP] = {
 		.index		= PROTO_RTP_SAVP,
 		.name		= "RTP/SAVP",
+		.avpf_proto	= PROTO_RTP_SAVPF,
 		.rtp		= 1,
 		.srtp		= 1,
 		.avpf		= 0,
@@ -125,6 +127,7 @@ const struct transport_protocol transport_protocols[] = {
 	[PROTO_UDP_TLS_RTP_SAVP] = {
 		.index		= PROTO_UDP_TLS_RTP_SAVP,
 		.name		= "UDP/TLS/RTP/SAVP",
+		.avpf_proto	= PROTO_UDP_TLS_RTP_SAVPF,
 		.rtp		= 1,
 		.srtp		= 1,
 		.avpf		= 0,
@@ -1020,6 +1023,7 @@ void kernelize(struct packet_stream *stream) {
 	struct call *call = stream->call;
 	struct packet_stream *sink = NULL;
 	const char *nk_warn_msg;
+	int non_forwarding = 0;
 
 	if (PS_ISSET(stream, KERNELIZED))
 		return;
@@ -1030,15 +1034,19 @@ void kernelize(struct packet_stream *stream) {
 	nk_warn_msg = "interface to kernel module not open";
 	if (!kernel.is_open)
 		goto no_kernel_warn;
-	if (!PS_ISSET(stream, RTP))
-		goto no_kernel;
+	if (!PS_ISSET(stream, RTP)) {
+		if (PS_ISSET(stream, RTCP) && PS_ISSET(stream, STRICT_SOURCE))
+			non_forwarding = 1; // use the kernel's source checking capability
+		else
+			goto no_kernel;
+	}
 	if (!stream->selected_sfd)
 		goto no_kernel;
 	if (stream->media->monologue->block_media || call->block_media)
 		goto no_kernel;
 
-        ilog(LOG_INFO, "Kernelizing media stream: %s%s%s:%s%d%s",
-			FMT_M(sockaddr_print_buf(&stream->endpoint.address)), FMT_M(stream->endpoint.port));
+        ilog(LOG_INFO, "Kernelizing media stream: %s%s:%d%s",
+			FMT_M(sockaddr_print_buf(&stream->endpoint.address), stream->endpoint.port));
 
 	sink = packet_stream_sink(stream);
 	if (!sink) {
@@ -1075,6 +1083,7 @@ void kernelize(struct packet_stream *stream) {
 	reti.rtcp_mux = MEDIA_ISSET(stream->media, RTCP_MUX);
 	reti.dtls = MEDIA_ISSET(stream->media, DTLS);
 	reti.stun = stream->media->ice_agent ? 1 : 0;
+	reti.non_forwarding = non_forwarding;
 
 	__re_address_translate_ep(&reti.dst_addr, &sink->endpoint);
 	__re_address_translate_ep(&reti.src_addr, &sink->selected_sfd->socket.local);
@@ -1156,7 +1165,8 @@ void __unkernelize(struct packet_stream *p) {
 
 void __stream_unconfirm(struct packet_stream *ps) {
 	__unkernelize(ps);
-	PS_CLEAR(ps, CONFIRMED);
+	if (!MEDIA_ISSET(ps->media, ASYMMETRIC))
+		PS_CLEAR(ps, CONFIRMED);
 	ps->handler = NULL;
 }
 static void stream_unconfirm(struct packet_stream *ps) {
@@ -1177,8 +1187,9 @@ void unkernelize(struct packet_stream *ps) {
 
 
 const struct streamhandler *determine_handler(const struct transport_protocol *in_proto,
-		const struct transport_protocol *out_proto, int must_recrypt)
+		struct call_media *out_media, int must_recrypt)
 {
+	const struct transport_protocol *out_proto = out_media->protocol;
 	const struct streamhandler * const *sh_pp, *sh;
 	const struct streamhandler * const * const *matrix;
 
@@ -1189,7 +1200,15 @@ const struct streamhandler *determine_handler(const struct transport_protocol *i
 	sh_pp = matrix[in_proto->index];
 	if (!sh_pp)
 		goto err;
-	sh = sh_pp[out_proto->index];
+
+	// special handling for RTP/AVP with advertised a=rtcp-fb
+	int out_proto_idx = out_proto->index;
+	if (out_media && MEDIA_ISSET(out_media, RTCP_FB)) {
+		if (!out_proto->avpf && out_proto->avpf_proto)
+			out_proto_idx = out_proto->avpf_proto;
+	}
+	sh = sh_pp[out_proto_idx];
+
 	if (!sh)
 		goto err;
 	return sh;
@@ -1227,7 +1246,7 @@ static void __determine_handler(struct packet_stream *in, const struct packet_st
 				|| crypto_params_cmp(&out->crypto.params, &in->selected_sfd->crypto.params)))
 		must_recrypt = 1;
 
-	in->handler = determine_handler(in_proto, out_proto, must_recrypt);
+	in->handler = determine_handler(in_proto, out->media, must_recrypt);
 	return;
 
 err:
@@ -1513,7 +1532,7 @@ static int media_packet_address_check(struct packet_handler_ctx *phc)
 	}
 
 	/* do not pay attention to source addresses of incoming packets for asymmetric streams */
-	if (MEDIA_ISSET(phc->mp.media, ASYMMETRIC))
+	if (MEDIA_ISSET(phc->mp.media, ASYMMETRIC) || rtpe_config.endpoint_learning == EL_OFF)
 		PS_SET(phc->mp.stream, CONFIRMED);
 
 	/* confirm sink for unidirectional streams in order to kernelize */
@@ -1530,7 +1549,7 @@ static int media_packet_address_check(struct packet_handler_ctx *phc)
 			int tmp = memcmp(&endpoint, &phc->mp.stream->endpoint, sizeof(endpoint));
 			if (tmp && PS_ISSET(phc->mp.stream, MEDIA_HANDOVER)) {
 				/* out_lock remains locked */
-				ilog(LOG_INFO, "Peer address changed to %s%s%s",
+				ilog(LOG_INFO | LOG_FLAG_LIMIT, "Peer address changed to %s%s%s",
 						FMT_M(endpoint_print_buf(&phc->mp.fsin)));
 				phc->unkernelize = 1;
 				phc->update = 1;
@@ -1541,18 +1560,53 @@ static int media_packet_address_check(struct packet_handler_ctx *phc)
 			mutex_unlock(&phc->mp.stream->out_lock);
 
 			if (tmp && PS_ISSET(phc->mp.stream, STRICT_SOURCE)) {
-				ilog(LOG_INFO, "Drop due to strict-source attribute; got %s%s%s:%s%d%s, "
-						"expected %s%s%s:%s%d%s",
-					FMT_M(sockaddr_print_buf(&endpoint.address)), FMT_M(endpoint.port),
-					FMT_M(sockaddr_print_buf(&phc->mp.stream->endpoint.address)),
-					FMT_M(phc->mp.stream->endpoint.port));
+				ilog(LOG_INFO | LOG_FLAG_LIMIT, "Drop due to strict-source attribute; "
+						"got %s%s:%d%s, "
+						"expected %s%s:%d%s",
+					FMT_M(sockaddr_print_buf(&endpoint.address), endpoint.port),
+					FMT_M(sockaddr_print_buf(&phc->mp.stream->endpoint.address),
+					phc->mp.stream->endpoint.port));
 				atomic64_inc(&phc->mp.stream->stats.errors);
 				ret = -1;
-				goto out;
 			}
 		}
 		phc->kernelize = 1;
 		goto out;
+	}
+
+	const struct endpoint *use_endpoint_confirm = &phc->mp.fsin;
+
+	if (rtpe_config.endpoint_learning == EL_IMMEDIATE)
+		goto confirm_now;
+
+	if (rtpe_config.endpoint_learning == EL_HEURISTIC
+			&& phc->mp.stream->advertised_endpoint.address.family
+			&& phc->mp.stream->advertised_endpoint.port)
+	{
+		// possible endpoints that can be detected in order of preference:
+		// 0: endpoint that matches the address advertised in the SDP
+		// 1: endpoint with the same address but different port
+		// 2: endpoint with the same port but different address
+		// 3: endpoint with both different port and different address
+		unsigned int idx = 0;
+		if (phc->mp.fsin.port != phc->mp.stream->advertised_endpoint.port)
+			idx |= 1;
+		if (memcmp(&phc->mp.fsin.address, &phc->mp.stream->advertised_endpoint.address,
+					sizeof(sockaddr_t)))
+			idx |= 2;
+
+		// fill appropriate slot
+		phc->mp.stream->detected_endpoints[idx] = phc->mp.fsin;
+
+		// now grab the best matched endpoint
+		for (idx = 0; idx < 4; idx++) {
+			use_endpoint_confirm = &phc->mp.stream->detected_endpoints[idx];
+			if (use_endpoint_confirm->address.family) {
+				if (idx == 0) // doesn't get any better than this
+					goto confirm_now;
+				break;
+			}
+		}
 	}
 
 	/* wait at least 3 seconds after last signal before committing to a particular
@@ -1560,17 +1614,18 @@ static int media_packet_address_check(struct packet_handler_ctx *phc)
 	if (!phc->mp.call->last_signal || rtpe_now.tv_sec <= phc->mp.call->last_signal + 3)
 		goto update_peerinfo;
 
+confirm_now:
 	phc->kernelize = 1;
 	phc->update = 1;
 
-	ilog(LOG_INFO, "Confirmed peer address as %s%s%s", FMT_M(endpoint_print_buf(&phc->mp.fsin)));
+	ilog(LOG_INFO, "Confirmed peer address as %s%s%s", FMT_M(endpoint_print_buf(use_endpoint_confirm)));
 
 	PS_SET(phc->mp.stream, CONFIRMED);
 
 update_peerinfo:
 	mutex_lock(&phc->mp.stream->out_lock);
 	endpoint = phc->mp.stream->endpoint;
-	phc->mp.stream->endpoint = phc->mp.fsin;
+	phc->mp.stream->endpoint = *use_endpoint_confirm;
 	if (memcmp(&endpoint, &phc->mp.stream->endpoint, sizeof(endpoint))) {
 		phc->unkernelize = 1;
 		phc->update = 1;
@@ -1611,6 +1666,9 @@ static void media_packet_kernel_check(struct packet_handler_ctx *phc) {
 				phc->mp.stream->endpoint.port);
 		return;
 	}
+
+	if (MEDIA_ISSET(phc->sink->media, ASYMMETRIC))
+		PS_SET(phc->sink, CONFIRMED);
 
 	if (!PS_ISSET(phc->sink, CONFIRMED)) {
 		__C_DBG("sink not CONFIRMED for stream %s:%d",
@@ -1766,12 +1824,10 @@ static int stream_packet(struct packet_handler_ctx *phc) {
 
 
 	int address_check = media_packet_address_check(phc);
-	if (address_check)
-		goto drop;
-
 	if (phc->kernelize)
 		media_packet_kernel_check(phc);
-
+	if (address_check)
+		goto drop;
 
 	mutex_lock(&phc->sink->out_lock);
 

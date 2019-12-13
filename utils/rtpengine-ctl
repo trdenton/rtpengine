@@ -4,35 +4,49 @@ use strict;
 use warnings;
 
 use IO::Socket::INET;
+use Getopt::Long;
+use Config::Tiny;
 
-my $num_args = $#ARGV + 1;
-if ( ($num_args == 0) or
-     (($num_args == 1) && (($ARGV[0] eq "--help") or ($ARGV[0] eq "-h"))) )
-{
-    showusage();
-    exit;
-}
+my $ip;
+my $port;
+my $conffile = '/etc/rtpengine/rtpengine.conf';
+my $listen;
 
-my $argumentstring = "";
-my $ip = "127.0.0.1";
-my $port = "9900";
+my $optret = GetOptions(
+    'help|h'              => sub { showusage(); exit 0; },
+    'ip=s'                => \$ip,
+    'port=i'              => \$port,
+    'config-file=s'       => \$conffile,
+);
 
-for (my $argnum=0; $argnum <= $#ARGV; $argnum++) {
-    if ($ARGV[$argnum] eq "-ip") {
-	die "No argument after -ip\n" unless $argnum+1<=$#ARGV;
-        $argnum = $argnum+1;
-	$ip = $ARGV[$argnum];
-	if ($ip =~ s/:(\d)$//) {
-		$port = $1;
-	}
-    } elsif ($ARGV[$argnum] eq "-port") {
-	die "No argument after -port\n" unless $argnum+1<=$#ARGV;
-        $argnum = $argnum+1;
-	$port = $ARGV[$argnum];
-    } else {
-	$argumentstring .= "$ARGV[$argnum] ";
+if (-f $conffile) {
+    my $config = Config::Tiny->read($conffile);
+    $config or die "Failed to read config file: " . Config::Tiny->errstr;
+
+    $listen = $config->{rtpengine}{'listen-cli'}
+        if $config->{rtpengine};
+    if ($listen =~ /^\d+$/) {
+        $port //= $listen;
+    }
+    else {
+        $ip //= $listen;
     }
 }
+
+if ($ip && $ip =~ s/:(\d+)$//) {
+    $port = $1;
+}
+
+my $argumentstring = "@ARGV";
+$argumentstring = trim($argumentstring);
+
+if (!$argumentstring || !$optret || $port <= 0 || $port > 65535) {
+    showusage();
+    exit 1;
+}
+
+$ip //= '127.0.0.1';
+$port //= 9900;
 
 # create a connecting socket
 my $socket = new IO::Socket::INET (
@@ -48,7 +62,6 @@ $socket->autoflush(1);
 setsockopt($socket, SOL_SOCKET, SO_SNDTIMEO, pack('L!L!', 3, 0) ) or die $!;
 setsockopt($socket, SOL_SOCKET, SO_RCVTIMEO, pack('L!L!', 3, 0) ) or die $!;
 
-$argumentstring = trim($argumentstring);
 my $size = $socket->send("$argumentstring\n");
  
 # receive a response of up to 10MB

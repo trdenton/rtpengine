@@ -290,8 +290,11 @@ retry:
 		sigprocmask(SIG_SETMASK, &ss, NULL);
 		closelog();
 
-		for (i = 0; i < 100; i++)
+		for (i = 0; i < 100; i++) {
+			if (i == 2 && rtpe_config.common.log_stderr)
+				continue;
 			close(i);
+		}
 
 		if (!rtpe_config.common.log_stderr) {
 			openlog("rtpengine/child", LOG_PID | LOG_NDELAY, LOG_DAEMON);
@@ -689,8 +692,8 @@ struct call_media *call_media_new(struct call *call) {
 	med->call = call;
 	med->codecs_recv = g_hash_table_new_full(g_int_hash, g_int_equal, NULL, NULL);
 	med->codecs_send = g_hash_table_new_full(g_int_hash, g_int_equal, NULL, NULL);
-	med->codec_names_recv = g_hash_table_new_full(str_hash, str_equal, NULL, (void (*)(void*)) g_queue_free);
-	med->codec_names_send = g_hash_table_new_full(str_hash, str_equal, NULL, (void (*)(void*)) g_queue_free);
+	med->codec_names_recv = g_hash_table_new_full(str_case_hash, str_case_equal, NULL, (void (*)(void*)) g_queue_free);
+	med->codec_names_send = g_hash_table_new_full(str_case_hash, str_case_equal, NULL, (void (*)(void*)) g_queue_free);
 	return med;
 }
 
@@ -996,10 +999,17 @@ void call_media_state_machine(struct call_media *m) {
 static int __init_stream(struct packet_stream *ps) {
 	struct call_media *media = ps->media;
 	struct call *call = ps->call;
-	int active = -1;
+	int dtls_active = -1;
 	AUTO_CLEANUP_BUF(paramsbuf);
+	struct dtls_connection *dtls_conn = NULL;
 
-	if (MEDIA_ISSET(media, SDES)) {
+	if (MEDIA_ISSET(media, DTLS)) {
+		dtls_conn = dtls_ptr(ps->selected_sfd);
+		if (dtls_conn)
+			dtls_active = dtls_is_active(dtls_conn);
+	}
+
+	if (MEDIA_ISSET(media, SDES) && dtls_active == -1) {
 		for (GList *l = ps->sfds.head; l; l = l->next) {
 			struct stream_fd *sfd = l->data;
 			struct crypto_params_sdes *cps = media->sdes_in.head
@@ -1018,19 +1028,16 @@ static int __init_stream(struct packet_stream *ps) {
 	}
 
 	if (MEDIA_ISSET(media, DTLS) && !PS_ISSET(ps, FALLBACK_RTCP)) {
-		struct dtls_connection *d = dtls_ptr(ps->selected_sfd);
-		if (d)
-			active = dtls_is_active(d);
 		// we try to retain our role if possible, but must handle a role switch
-		if ((active && !MEDIA_ISSET(media, SETUP_ACTIVE))
-				|| (!active && !MEDIA_ISSET(media, SETUP_PASSIVE)))
-			active = -1;
-		if (active == -1)
-			active = (PS_ISSET(ps, FILLED) && MEDIA_ISSET(media, SETUP_ACTIVE));
-		dtls_connection_init(&ps->ice_dtls, ps, active, call->dtls_cert);
+		if ((dtls_active && !MEDIA_ISSET(media, SETUP_ACTIVE))
+				|| (!dtls_active && !MEDIA_ISSET(media, SETUP_PASSIVE)))
+			dtls_active = -1;
+		if (dtls_active == -1)
+			dtls_active = (PS_ISSET(ps, FILLED) && MEDIA_ISSET(media, SETUP_ACTIVE));
+		dtls_connection_init(&ps->ice_dtls, ps, dtls_active, call->dtls_cert);
 		for (GList *l = ps->sfds.head; l; l = l->next) {
 			struct stream_fd *sfd = l->data;
-			dtls_connection_init(&sfd->dtls, ps, active, call->dtls_cert);
+			dtls_connection_init(&sfd->dtls, ps, dtls_active, call->dtls_cert);
 		}
 
 		if (!PS_ISSET(ps, FINGERPRINT_VERIFIED) && media->fingerprint.hash_func
@@ -1370,11 +1377,15 @@ static void __generate_crypto(const struct sdp_ng_flags *flags, struct call_medi
 		struct crypto_params_sdes *cps_in = cpq_in->head ? cpq_in->head->data : NULL;
 		struct crypto_params_sdes *offered_cps = offered_cpq->head ? offered_cpq->head->data : NULL;
 		if (offered_cps) {
+			ilog(LOG_DEBUG, "Looking for matching crypto suite to offered %u:%s", offered_cps->tag,
+					offered_cps->params.crypto_suite->name);
 			// check if we can do SRTP<>SRTP passthrough. the crypto suite that was accepted
 			// must have been present in what was offered to us
 			for (GList *l = cpq_in->head; l; l = l->next) {
 				struct crypto_params_sdes *check_cps = l->data;
 				if (check_cps->params.crypto_suite == offered_cps->params.crypto_suite) {
+					ilog(LOG_DEBUG, "Found matching crypto suite %u:%s", check_cps->tag,
+							check_cps->params.crypto_suite->name);
 					cps_in = check_cps;
 					break;
 				}
@@ -1391,6 +1402,8 @@ static void __generate_crypto(const struct sdp_ng_flags *flags, struct call_medi
 				// SRTP<>SRTP passthrough
 				cps->params.session_params = cps_in->params.session_params; // XXX verify
 				crypto_params_copy(&cps->params, &offered_cps->params, 1);
+				ilog(LOG_DEBUG, "Copied crypto params from %i:%s for SRTP passthrough",
+						cps_in->tag, cps_in->params.crypto_suite->name);
 			}
 			else {
 				random_string((unsigned char *) cps->params.master_key,
@@ -1399,7 +1412,20 @@ static void __generate_crypto(const struct sdp_ng_flags *flags, struct call_medi
 						cps->params.crypto_suite->master_salt_len);
 				/* mki = mki_len = 0 */
 				cps->params.session_params = cps_in->params.session_params;
+				ilog(LOG_DEBUG, "Creating new SRTP crypto params for %i:%s",
+						cps->tag, cps->params.crypto_suite->name);
 			}
+
+			// flush out crypto suites we ended up not using - leave only one
+#if GLIB_CHECK_VERSION(2,30,0)
+			if (!g_queue_remove(cpq_in, cps_in))
+				ilog(LOG_ERR, "BUG: incoming crypto suite not found in queue");
+#else
+			g_queue_remove(cpq_in, cps_in);
+#endif
+			crypto_params_sdes_queue_clear(cpq_in);
+			g_queue_push_tail(cpq_in, cps_in);
+
 			__sdes_flags(cps, flags);
 			__sdes_flags(cps_in, flags);
 		}
@@ -1483,7 +1509,7 @@ static void __rtcp_mux_logic(const struct sdp_ng_flags *flags, struct call_media
 	if (flags->opmode == OP_ANSWER) {
 		/* default is to go with the client's choice, unless we were instructed not
 		 * to do that in the offer (see below) */
-		if (!MEDIA_ISSET(media, RTCP_MUX_OVERRIDE))
+		if (!MEDIA_ISSET(other_media, RTCP_MUX_OVERRIDE))
 			bf_copy_same(&media->media_flags, &other_media->media_flags, MEDIA_FLAG_RTCP_MUX);
 
 		return;
@@ -1506,14 +1532,14 @@ static void __rtcp_mux_logic(const struct sdp_ng_flags *flags, struct call_media
 	/* we can also control what's going to happen in the answer. it
 	 * depends on what was offered, but by default we go with the other
 	 * client's choice */
-	MEDIA_CLEAR(other_media, RTCP_MUX_OVERRIDE);
+	MEDIA_CLEAR(media, RTCP_MUX_OVERRIDE);
 	if (MEDIA_ISSET(other_media, RTCP_MUX)) {
 		if (!MEDIA_ISSET(media, RTCP_MUX)) {
 			/* rtcp-mux was offered, but we don't offer it ourselves.
 			 * the answer will not accept rtcp-mux (wasn't offered).
 			 * the default is to accept the offer, unless we want to
 			 * explicitly reject it. */
-			MEDIA_SET(other_media, RTCP_MUX_OVERRIDE);
+			MEDIA_SET(media, RTCP_MUX_OVERRIDE);
 			if (flags->rtcp_mux_reject)
 				MEDIA_CLEAR(other_media, RTCP_MUX);
 		}
@@ -1523,9 +1549,9 @@ static void __rtcp_mux_logic(const struct sdp_ng_flags *flags, struct call_media
 			 * either explicitly accept it (possibly demux) or reject
 			 * it (possible reverse demux). */
 			if (flags->rtcp_mux_accept)
-				MEDIA_SET(other_media, RTCP_MUX_OVERRIDE);
+				MEDIA_SET(media, RTCP_MUX_OVERRIDE);
 			else if (flags->rtcp_mux_reject) {
-				MEDIA_SET(other_media, RTCP_MUX_OVERRIDE);
+				MEDIA_SET(media, RTCP_MUX_OVERRIDE);
 				MEDIA_CLEAR(other_media, RTCP_MUX);
 			}
 		}
@@ -1533,7 +1559,7 @@ static void __rtcp_mux_logic(const struct sdp_ng_flags *flags, struct call_media
 	else {
 		/* rtcp-mux was not offered. we may offer it, but since it wasn't
 		 * offered to us, we must not accept it. */
-		MEDIA_SET(other_media, RTCP_MUX_OVERRIDE);
+		MEDIA_SET(media, RTCP_MUX_OVERRIDE);
 	}
 }
 
@@ -1772,7 +1798,7 @@ static void __update_media_id(struct call_media *media, struct call_media *other
 
 /* called with call->master_lock held in W */
 int monologue_offer_answer(struct call_monologue *other_ml, GQueue *streams,
-		const struct sdp_ng_flags *flags)
+		struct sdp_ng_flags *flags)
 {
 	struct stream_params *sp;
 	GList *media_iter, *ml_media, *other_ml_media;
@@ -1861,7 +1887,8 @@ int monologue_offer_answer(struct call_monologue *other_ml, GQueue *streams,
 			/* copy parameters advertised by the sender of this message */
 			bf_copy_same(&other_media->media_flags, &sp->sp_flags,
 					SHARED_FLAG_RTCP_MUX | SHARED_FLAG_ASYMMETRIC | SHARED_FLAG_UNIDIRECTIONAL |
-					SHARED_FLAG_ICE | SHARED_FLAG_TRICKLE_ICE | SHARED_FLAG_ICE_LITE);
+					SHARED_FLAG_ICE | SHARED_FLAG_TRICKLE_ICE | SHARED_FLAG_ICE_LITE |
+					SHARED_FLAG_RTCP_FB);
 
 			// steal the entire queue of offered crypto params
 			crypto_params_sdes_queue_clear(&other_media->sdes_in);
@@ -1900,6 +1927,14 @@ int monologue_offer_answer(struct call_monologue *other_ml, GQueue *streams,
 		bf_copy(&other_media->media_flags, MEDIA_FLAG_RECV, &sp->sp_flags, SP_FLAG_SEND);
 		bf_copy(&other_media->media_flags, MEDIA_FLAG_SEND, &sp->sp_flags, SP_FLAG_RECV);
 
+		/* deduct address family from stream parameters received */
+		other_media->desired_family = sp->rtp_endpoint.address.family;
+		/* for outgoing SDP, use "direction"/DF or default to what was offered */
+		if (!media->desired_family)
+			media->desired_family = other_media->desired_family;
+		if (sp->desired_family)
+			media->desired_family = sp->desired_family;
+
 		if (sp->rtp_endpoint.port) {
 			/* DTLS stuff */
 			__dtls_logic(flags, other_media, sp);
@@ -1910,13 +1945,6 @@ int monologue_offer_answer(struct call_monologue *other_ml, GQueue *streams,
 			/* SDES and DTLS */
 			__generate_crypto(flags, media, other_media);
 
-			/* deduct address family from stream parameters received */
-			other_media->desired_family = sp->rtp_endpoint.address.family;
-			/* for outgoing SDP, use "direction"/DF or default to what was offered */
-			if (!media->desired_family)
-				media->desired_family = other_media->desired_family;
-			if (sp->desired_family)
-				media->desired_family = sp->desired_family;
 		}
 
 		/* determine number of consecutive ports needed locally.
@@ -2454,6 +2482,8 @@ void __monologue_tag(struct call_monologue *ml, const str *tag) {
 	struct call *call = ml->call;
 
 	__C_DBG("tagging monologue with '"STR_FORMAT"'", STR_FMT(tag));
+	if (ml->tag.s)
+		g_hash_table_remove(call->tags, &ml->tag);
 	call_str_cpy(call, &ml->tag, tag);
 	g_hash_table_insert(call->tags, &ml->tag, ml);
 }
@@ -2518,6 +2548,8 @@ static void __monologue_destroy(struct call_monologue *monologue) {
 	call = monologue->call;
 
 	g_hash_table_remove(call->tags, &monologue->tag);
+	if (monologue->viabranch.s)
+		g_hash_table_remove(call->viabranches, &monologue->viabranch);
 
 	l = g_hash_table_get_values(monologue->other_tags);
 
@@ -2538,7 +2570,7 @@ static int monologue_destroy(struct call_monologue *ml) {
 
 	__monologue_destroy(ml);
 
-	if (!g_hash_table_size(c->tags)) {
+	if (g_hash_table_size(c->tags) < 2 && g_hash_table_size(c->viabranches) == 0) {
 		ilog(LOG_INFO, "Call branch '" STR_FORMAT_M "' (%s" STR_FORMAT "%svia-branch '" STR_FORMAT_M "') "
 				"deleted, no more branches remaining",
 				STR_FMT_M(&ml->tag),
@@ -2671,7 +2703,7 @@ static struct call_monologue *call_get_dialogue(struct call *call, const str *fr
 
 	/* the fromtag monologue may be newly created, or half-complete from the totag, or
 	 * derived from the viabranch. */
-	if (!ft->tag.s)
+	if (!ft->tag.s || str_cmp_str(&ft->tag, fromtag))
 		__monologue_tag(ft, fromtag);
 
 	__monologue_unkernelize(ft->active_dialogue);

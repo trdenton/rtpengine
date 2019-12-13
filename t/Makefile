@@ -16,6 +16,7 @@ CFLAGS+=	$(shell pkg-config --cflags libavformat)
 CFLAGS+=	$(shell pkg-config --cflags libavutil)
 CFLAGS+=	$(shell pkg-config --cflags libswresample)
 CFLAGS+=	$(shell pkg-config --cflags libavfilter)
+CFLAGS+=	$(shell pkg-config --cflags spandsp)
 CFLAGS+=	-DWITH_TRANSCODING
 CFLAGS+=	$(shell pkg-config --cflags zlib)
 CFLAGS+=	$(shell pkg-config --cflags json-glib-1.0)
@@ -43,6 +44,7 @@ LDLIBS+=	$(shell pkg-config --libs libavformat)
 LDLIBS+=	$(shell pkg-config --libs libavutil)
 LDLIBS+=	$(shell pkg-config --libs libswresample)
 LDLIBS+=	$(shell pkg-config --libs libavfilter)
+LDLIBS+=	$(shell pkg-config --libs spandsp)
 LDLIBS+=	$(shell pkg-config --libs zlib)
 LDLIBS+=	$(shell pkg-config --libs json-glib-1.0)
 LDLIBS+=	-lpcap
@@ -54,17 +56,17 @@ LDLIBS+=	-lhiredis
 LDLIBS+=	$(shell mysql_config --libs)
 endif
 
-SRCS=		bitstr-test.c aes-crypt.c payload-tracker-test.c const_str_hash-test.strhash.c
+SRCS=		bitstr-test.c aes-crypt.c const_str_hash-test.strhash.c
 LIBSRCS=	loglib.c auxlib.c str.c rtplib.c
 DAEMONSRCS=	crypto.c ssrc.c aux.c rtp.c
 HASHSRCS=
 
 ifeq ($(with_transcoding),yes)
-SRCS+=		transcode-test.c
+SRCS+=		transcode-test.c test-dtmf-detect.c payload-tracker-test.c
 ifeq ($(with_amr_tests),yes)
 SRCS+=		amr-decode-test.c amr-encode-test.c
 endif
-LIBSRCS+=	codeclib.c resample.c socket.c streambuf.c
+LIBSRCS+=	codeclib.c resample.c socket.c streambuf.c dtmflib.c
 DAEMONSRCS+=	codec.c call.c ice.c kernel.c media_socket.c stun.c bencode.c poller.c \
 		dtls.c recording.c statistics.c rtcp.c redis.c iptables.c graphite.c \
 		cookie_cache.c udp_listener.c homer.c load.c cdr.c dtmf.c timerthread.c \
@@ -82,9 +84,9 @@ include		.depend
 
 .PHONY:		all-tests unit-tests daemon-tests
 
-TESTS=		bitstr-test aes-crypt payload-tracker-test const_str_hash-test.strhash
+TESTS=		bitstr-test aes-crypt const_str_hash-test.strhash
 ifeq ($(with_transcoding),yes)
-TESTS+=		transcode-test
+TESTS+=		transcode-test test-dtmf-detect payload-tracker-test
 ifeq ($(with_amr_tests),yes)
 TESTS+=		amr-decode-test amr-encode-test
 endif
@@ -92,7 +94,11 @@ endif
 
 ADD_CLEAN=	tests-preload.so $(TESTS)
 
+ifeq ($(with_transcoding),yes)
 all-tests:	unit-tests daemon-tests
+else
+all-tests:	unit-tests
+endif
 	true # override linking recipe from common.Makefile
 
 unit-tests:	$(TESTS)
@@ -109,9 +115,11 @@ daemon-tests:	tests-preload.so
 
 bitstr-test:	bitstr-test.o
 
-amr-decode-test: amr-decode-test.o $(COMMONOBJS) codeclib.o resample.o
+amr-decode-test: amr-decode-test.o $(COMMONOBJS) codeclib.o resample.o dtmflib.o
 
-amr-encode-test: amr-encode-test.o $(COMMONOBJS) codeclib.o resample.o
+amr-encode-test: amr-encode-test.o $(COMMONOBJS) codeclib.o resample.o dtmflib.o
+
+test-dtmf-detect: test-dtmf-detect.o
 
 aes-crypt:	aes-crypt.o $(COMMONOBJS) crypto.o
 
@@ -120,12 +128,16 @@ transcode-test:	transcode-test.o $(COMMONOBJS) codeclib.o resample.o codec.o ssr
 	rtcp.o redis.o iptables.o graphite.o call_interfaces.strhash.o sdp.strhash.o rtp.o crypto.o \
 	control_ng.strhash.o \
 	streambuf.o cookie_cache.o udp_listener.o homer.o load.o cdr.o dtmf.o timerthread.o \
-	media_player.o
+	media_player.o dtmflib.o
 
 payload-tracker-test: payload-tracker-test.o $(COMMONOBJS) ssrc.o aux.o auxlib.o rtp.o crypto.o codeclib.o \
-	resample.o
+	resample.o dtmflib.o
 
 const_str_hash-test.strhash: const_str_hash-test.strhash.o $(COMMONOBJS)
 
 tests-preload.so:	tests-preload.c
 	$(CC) -g -D_GNU_SOURCE -std=c99 -o $@ -Wall -shared -fPIC $<
+
+ifeq ($(with_transcoding),yes)
+.depend: dtmf_rx_fillin.h
+endif

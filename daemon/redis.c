@@ -571,6 +571,11 @@ static int redis_notify(void) {
 	return 0;
 }
 
+static void redis_disconnect(void) {
+	redisAsyncDisconnect(rtpe_redis_notify_async_context);
+	rtpe_redis_notify_async_context = NULL;
+}
+
 void redis_notify_loop(void *d) {
 	int seconds = 1, redis_notify_return = 0;
 	time_t next_run = rtpe_now.tv_sec;
@@ -614,6 +619,7 @@ void redis_notify_loop(void *d) {
 		next_run = rtpe_now.tv_sec + seconds;
 
 		if (redis_check_conn(r) == REDIS_STATE_RECONNECTED || redis_notify_return < 0) {
+			redis_disconnect();
 			// alloc new redis async context upon redis breakdown
 			if (redis_async_context_alloc() < 0) {
 				continue;
@@ -628,7 +634,7 @@ void redis_notify_loop(void *d) {
 	redis_notify_subscribe_action(UNSUBSCRIBE_ALL, 0);
 
 	// free async context
-	redisAsyncDisconnect(rtpe_redis_notify_async_context);
+	redis_disconnect();
 }
 
 struct redis *redis_new(const endpoint_t *ep, int db, const char *auth,
@@ -672,6 +678,7 @@ err:
 static void redis_close(struct redis *r) {
 	if (r->ctx)
 		redisFree(r->ctx);
+	r->ctx = NULL;
 	mutex_destroy(&r->lock);
 	g_slice_free1(sizeof(*r), r);
 }
@@ -1079,7 +1086,7 @@ err:
 	return -1;
 }
 static int redis_hash_get_sdes_params(GQueue *out, const struct redis_hash *h, const char *k) {
-	char key[32], tagkey[32];
+	char key[32], tagkey[64];
 	const char *kk = k;
 	unsigned int tag;
 	unsigned int iter = 0;
@@ -1088,7 +1095,7 @@ static int redis_hash_get_sdes_params(GQueue *out, const struct redis_hash *h, c
 		snprintf(tagkey, sizeof(tagkey), "%s_tag", kk);
 		if (redis_hash_get_unsigned(&tag, h, tagkey))
 			break;
-		struct crypto_params_sdes *cps = g_slice_alloc0(sizeof(cps));
+		struct crypto_params_sdes *cps = g_slice_alloc0(sizeof(*cps));
 		cps->tag = tag;
 		int ret = redis_hash_get_sdes_params1(&cps->params, h, kk);
 		if (ret) {

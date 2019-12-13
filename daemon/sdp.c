@@ -203,6 +203,7 @@ struct sdp_attribute {	/* example: a=rtpmap:8 PCMA/8000 */
 		ATTR_IGNORE,
 		ATTR_RTPENGINE,
 		ATTR_PTIME,
+		ATTR_RTCP_FB,
 		ATTR_END_OF_CANDIDATES,
 	} attr;
 
@@ -869,6 +870,9 @@ static int parse_attribute(struct sdp_attribute *a) {
 		case CSH_LOOKUP("end-of-candidates"):
 			a->attr = ATTR_END_OF_CANDIDATES;
 			break;
+		case CSH_LOOKUP("rtcp-fb"):
+			a->attr = ATTR_RTCP_FB;
+			break;
 	}
 
 	return ret;
@@ -1330,6 +1334,10 @@ int sdp_streams(const GQueue *sessions, GQueue *streams, struct sdp_ng_flags *fl
 			if (attr)
 				sp->media_id = attr->value;
 
+			// be ignorant about the contents
+			if (attr_get_by_id(&media->attributes, ATTR_RTCP_FB))
+				SP_SET(sp, RTCP_FB);
+
 			__sdp_ice(sp, media);
 
 			/* determine RTCP endpoint */
@@ -1545,15 +1553,15 @@ static int insert_ice_address(struct sdp_chopper *chop, struct stream_fd *sfd) {
 	return 0;
 }
 
-static int insert_raddr_rport(struct sdp_chopper *chop, struct packet_stream *ps, const struct local_intf *ifa) {
+static int insert_raddr_rport(struct sdp_chopper *chop, struct stream_fd *sfd) {
         char buf[64];
         int len;
 
 	chopper_append_c(chop, " raddr ");
-	call_stream_address46(buf, ps, SAF_ICE, &len, ifa, 0);
+	call_stream_address46(buf, sfd->stream, SAF_ICE, &len, sfd->local_intf, 0);
 	chopper_append(chop, buf, len);
 	chopper_append_c(chop, " rport ");
-	chopper_append_printf(chop, "%u", ps->selected_sfd->socket.local.port);
+	chopper_append_printf(chop, "%u", sfd->socket.local.port);
 
 	return 0;
 }
@@ -1812,7 +1820,7 @@ static void insert_candidate(struct sdp_chopper *chop, struct stream_fd *sfd,
 	chopper_append_c(chop, ice_candidate_type_str(type));
 	/* raddr and rport are required for non-host candidates: rfc5245 section-15.1 */
 	if(type != ICT_HOST)
-		insert_raddr_rport(chop, ps, ifa);
+		insert_raddr_rport(chop, sfd);
 	chopper_append_c(chop, "\r\n");
 }
 

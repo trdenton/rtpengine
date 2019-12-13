@@ -104,7 +104,7 @@ struct codec_def_s {
 	    support_decoding:1;
 
 	// flags
-	int pseudocodec:1,
+	int supplemental:1,
 	    dtmf:1; // special case
 
 	const codec_type_t *codec_type;
@@ -141,10 +141,16 @@ struct decoder_s {
 #ifdef HAVE_BCG729
 		bcg729DecoderChannelContextStruct *bcg729;
 #endif
+		struct {
+			unsigned long start_ts;
+			unsigned int event;
+			unsigned long duration;
+		} dtmf;
 	} u;
 
 	unsigned long rtp_ts;
 	uint64_t pts;
+	int ptime;
 };
 
 struct encoder_s {
@@ -195,8 +201,8 @@ const codec_def_t *codec_find_by_av(enum AVCodecID);
 enum media_type codec_get_type(const str *type);
 
 
-decoder_t *decoder_new_fmt(const codec_def_t *def, int clockrate, int channels, const format_t *resample_fmt);
-decoder_t *decoder_new_fmtp(const codec_def_t *def, int clockrate, int channels, const format_t *resample_fmt,
+decoder_t *decoder_new_fmt(const codec_def_t *def, int clockrate, int channels, int ptime, const format_t *resample_fmt);
+decoder_t *decoder_new_fmtp(const codec_def_t *def, int clockrate, int channels, int ptime, const format_t *resample_fmt,
 		const str *fmtp);
 void decoder_close(decoder_t *dec);
 int decoder_input_data(decoder_t *dec, const str *data, unsigned long ts,

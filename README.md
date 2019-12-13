@@ -44,6 +44,8 @@ the following additional features are available:
 - Breaking of BUNDLE'd media streams (draft-ietf-mmusic-sdp-bundle-negotiation)
 - Recording of media streams, decrypted if possible
 - Transcoding and repacketization
+- Transcoding between RFC 2833/4733 DTMF event packets and in-band DTMF tones (and vice versa)
+- Injection of DTMF events or PCM DTMF tones into running audio streams
 - Playback of pre-recorded streams/announcements
 
 *Rtpengine* does not (yet) support:
@@ -132,6 +134,7 @@ build all parts and run the test suite.
 	- *libevent* version 2.x
 	- *libpcap*
 	- *libsystemd*
+	- *spandsp*
 	- *MySQL* or *MariaDB* client library (optional for media playback and call recording daemon)
 	- *libiptc* library for iptables management (optional)
 	- *ffmpeg* codec libraries for transcoding (optional) such as *libavcodec*, *libavfilter*, *libswresample*
@@ -408,7 +411,8 @@ the necessary conversions.
 If repacketization (using the `ptime` option) is requested, the transcoding feature will also be
 engaged for the call, even if no additional codecs were requested.
 
-Non-audio pseudo-codecs (such as T.38 or RFC 4733 `telephone-event`) are not currently supported.
+Non-audio pseudo-codecs (such as T.38) are not currently supported, with the exception of RFC
+2833/4733 DTMF event packets (`telephone-event`) as described below.
 
 G.729 support
 -------------
@@ -431,6 +435,45 @@ can be removed from `debian/control` or by switching to a different Debian build
 Set the environment variable
 `export DEB_BUILD_PROFILES="pkg.ngcp-rtpengine.nobcg729"` (or use the `-P` flag to the *dpkg* tools)
 and then build the *rtpengine* packages.
+
+DTMF transcoding
+----------------
+
+*Rtpengine* supports transcoding between RFC 2833/4733 DTMF event packets (`telephone-event` payloads)
+and in-band DTMF audio tones. When enabled, *rtpengine* translates DTMF event packets to in-band DTMF
+audio by generating DTMF tones and injecting them into the audio stream, and translates in-band DTMF
+tones by running the audio stream through a DSP, and generating DTMF event packets when a DTMF tone
+is detected.
+
+Support for DTMF transcoding can be enabled in one of two ways:
+
+* In the forward direction, DTMF transcoding is enabled by adding the codec `telephone-event` to the
+  list of codecs offered for transcoding. Specifically, if the incoming SDP body doesn't yet list
+  `telephone-event` as a supported codec, adding the option *codec → transcode → telephone-event* would
+  enable DTMF transcoding. The receiving RTP client can then accept this codec and start sending DTMF
+  event packets, which *rtpengine* would translate into in-band DTMF audio. If the receiving RTP client
+  also offers `telephone-event` in their behalf, *rtpengine* would then detect in-band DTMF audio coming
+  from the originating RTP client and translate it to DTMF event packets.
+
+* In the reverse direction, DTMF transcoding is enabled by adding the option `always transcode` to the
+  `flags` if the incoming SDP body offers `telephone-event` as a supported codec. If the receiving RTP
+  client then rejects the offered `telephone-event` codec, DTMF transcoding is then enabled and is
+  performed in the same way as described above.
+
+Enabling DTMF transcoding (in one of the two ways described above) implicitly enables the flag
+`always transcode` for the call and forces all of the audio to pass through the transcoding engine.
+Therefore, for performance reasons, this should only be done when really necessary.
+
+Call recording
+==============
+
+Call recording can be accomplished in one of two ways: 
+
+* The *rtpengine* daemon can write `libpcap`-formatted captures directly (`--recording-method=pcap`);
+
+* The *rtpengine* daemon can write audio frames into a sink in `/proc/rtpengine` (`--recording-method=proc`). These frames must then be consumed within a short period by another process; while this can be any process, the packaged `rtpengine-recording` daemon is a useful ready implementation of a call recording solution. The recording daemon uses `ffmpeg` libraries to implement a variety of on-the-fly format conversion and mixing options, as well as metadata logging. See `rtpengine-recording -h` for details.
+
+**Important note**: The *rtpengine* daemon emits data into a "spool directory" (`--recording-dir` option), by default `/var/spool/rtpengine`. The recording daemon is then configured to consume this using the `--spool-dir` option, and to store the final emitted recordings (in whatever desired target format, etc.) in `--output-dir`. Ensure that the `--spool-dir` and the `--output-dir` are **different** directories, or you will run into problems (as discussed in [#81](https://github.com/sipwise/rtpengine/issues/808)).
 
 The *ng* Control Protocol
 =========================
@@ -469,6 +512,7 @@ a string and determines the type of message. Currently the following commands ar
 * stop forwarding
 * play media
 * stop media
+* play DTMF
 
 The response dictionary must contain at least one key called `result`. The value can be either `ok` or `error`.
 For the `ping` command, the additional value `pong` is allowed. If the result is `error`, then another key
@@ -671,6 +715,13 @@ Optionally included keys are:
 		unchanged. Normally *rtpengine* would consume these attributes and insert its
 		own version of them based on other media parameters (e.g. a media section with
 		a zero IP address would come out as `sendonly` or `inactive`).
+
+	- `inject DTMF`
+
+		Signals to *rtpengine* that the audio streams involved in this `offer` or `answer`
+		(the flag should be present in both of them) are to be made available for DTMF
+		injection via the `play DTMF` control message. See `play DTMF` below for additional
+		information.
 
 * `replace`
 
@@ -941,6 +992,9 @@ Optionally included keys are:
 		another slash followed by the bitrate in bits per second,
 		e.g. `opus/48000/2/32000`. In this case, all format parameters (clock rate,
 		channels) must also be specified.
+
+		Additional options that can be appended to the codec string with additional slashes
+		are ptime and the `fmtp` string, for example `iLBC/8000/1///mode=30`.
 
 		As a special case, if the `strip=all` option has been used and the `transcode`
 		option is used on a codec that was originally present in the offer, then
@@ -1459,3 +1513,30 @@ the media file could be determined. The duration is given as in integer represen
 Stops the playback previously started by a `play media` message. Media playback stops automatically when
 the end of the media file is reached, so this message is only useful for prematurely stopping playback.
 The same participant selection keys as for the `play media` message can and must be used.
+
+`play DTMF` Message
+-------------------
+
+Instructs *rtpengine* to inject a DTMF tone or event into a running audio stream. A call participant must
+be selected in the same way as described under the `block DTMF` message above. The selected call participant
+is the one generating the DTMF event, not the one receiving it.
+
+The dictionary key `code` must be present in the message, indicating the DTMF event to be generated. It can
+be either an integer with values 0-15, or a string containing a single character
+(`0` - `9`, `*`, `#`, `A` - `D`). Additional optional dictionary keys are: `duration` indicating the duration
+of the event in milliseconds (defaults to 250 ms, with a minimum of 100 and a maximum of 5000);
+`volume` indicating the volume in absolute decibels (defaults to -8 dB, with 0 being the maximum volume and
+positive integers being interpreted as negative); and `pause` indicating the pause in between consecutive
+DTMF events in milliseconds (defaults to 100 ms, with a minimum of 100 and a maximum of 5000).
+
+This message can be used to implement `application/dtmf-relay` or `application/dtmf` payloads carried
+in SIP INFO messages. Multiple DTMF events can be queued up by issuing multiple consecutive
+`play DTMF` messages.
+
+If the destination participant supports the `telephone-event` RTP payload type, then it will be used to
+send the DTMF event. Otherwise a PCM DTMF tone will be inserted into the audio stream. Audio samples
+received during a generated DTMF event will be suppressed.
+
+The call must be marked for DTMF injection using the `inject DTMF` flag used in both `offer` and `answer`
+messages. Enabling this flag forces all audio to go through the transcoding engine, even if input and output
+codecs are the same (similar to DTMF transcoding, see above).
